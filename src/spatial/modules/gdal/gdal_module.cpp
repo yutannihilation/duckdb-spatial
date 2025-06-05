@@ -4,6 +4,9 @@
 // GDAL includes
 #include "ogrsf_frmts.h"
 
+// DuckDB MultiFile includes
+#include "duckdb/common/multi_file/multi_file_function.hpp"
+
 // Spatial
 #include "spatial/spatial_types.hpp"
 #include "spatial/geometry/sgl.hpp"
@@ -2091,9 +2094,9 @@ void RegisterGDALModule(DatabaseInstance &db) {
 	ST_Write::Register(db);
 
 	// Register ST_Multi_Read using MultiFileReader
-	// TODO: Fix template call - CreateFunctionSet may not be a template in current DuckDB version
-	// TableFunction multi_read_func = MultiFileReader::CreateFunctionSet<GDALMultiLayerInfo>("ST_Multi_Read");
-	// ExtensionUtil::RegisterFunction(db, multi_read_func);
+	MultiFileFunction<GDALMultiLayerInfo> multi_read_func("ST_Multi_Read");
+	auto function_set = MultiFileReader::CreateFunctionSet(multi_read_func);
+	ExtensionUtil::RegisterFunction(db, function_set);
 
 	InsertionOrderPreservingMap<string> tags;
 	tags.insert("ext", "spatial");

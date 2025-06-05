@@ -22,7 +22,9 @@ class GDALFileReader : public BaseFileReader {
 public:
 	GDALFileReader(ClientContext &context, const OpenFileInfo &file_info, const GDALMultiLayerReaderOptions &options,
 	               vector<LogicalType> expected_types, vector<string> expected_names)
-	    : BaseFileReader(context, expected_types, expected_names), file_info(file_info), options(options),
+	    : BaseFileReader(file_info), file_info(file_info), options(options),
+	      dataset(nullptr, [](GDALDataset *ds) { if (ds) GDALClose(ds); }),
+	      expected_types(std::move(expected_types)), expected_names(std::move(expected_names)),
 	      current_row(0), finished(false) {
 		InitializeReader(context);
 	}
@@ -71,6 +73,10 @@ public:
 		}
 
 		output.SetCardinality(output_idx);
+	}
+
+	string GetReaderType() const override {
+		return "GDAL";
 	}
 
 private:
@@ -172,9 +178,10 @@ private:
 				if (options.options.keep_wkb) {
 					// Export as WKB
 					size_t wkb_size = geom->WkbSize();
-					string wkb_data(wkb_size, '\0');
-					geom->exportToWkb(wkbNDR, reinterpret_cast<unsigned char*>(wkb_data.data()));
-					FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, wkb_data);
+					std::vector<unsigned char> wkb_data(wkb_size);
+					geom->exportToWkb(wkbNDR, wkb_data.data());
+					string wkb_string(wkb_data.begin(), wkb_data.end());
+					FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, wkb_string);
 				} else {
 					// Convert to DuckDB GEOMETRY
 					char *wkt = nullptr;
@@ -196,6 +203,8 @@ private:
 	const GDALMultiLayerReaderOptions options;
 	GDALDatasetUniquePtr dataset;
 	OGRLayer *current_layer = nullptr;
+	vector<LogicalType> expected_types;
+	vector<string> expected_names;
 	idx_t current_row;
 	bool finished;
 };
@@ -330,19 +339,19 @@ void GDALMultiLayerInfo::BindReader(ClientContext &context, vector<LogicalType> 
 	}
 
 	// Get the first file to determine schema
-	auto first_file = multi_file_list.GetFirstFile();
-	if (!first_file) {
+	if (multi_file_list.IsEmpty()) {
 		throw IOException("No files found in file list");
 	}
+	auto first_file = multi_file_list.GetFirstFile();
 
 	// Open the first dataset to get schema information
 	auto dataset = GDALDatasetUniquePtr(
-		GDALDataset::Open(first_file->path.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+		GDALDataset::Open(first_file.path.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
 		                  options.allowed_drivers, options.open_options, options.sibling_files),
 		[](GDALDataset *ds) { GDALClose(ds); });
 
 	if (!dataset) {
-		throw IOException("Could not open file '%s'", first_file->path);
+		throw IOException("Could not open file '%s'", first_file.path);
 	}
 
 	// Get the layer
@@ -350,18 +359,18 @@ void GDALMultiLayerInfo::BindReader(ClientContext &context, vector<LogicalType> 
 	if (!options.layer_name.empty()) {
 		layer = dataset->GetLayerByName(options.layer_name.c_str());
 		if (!layer) {
-			throw IOException("Layer '%s' not found in file '%s'", options.layer_name, first_file->path);
+			throw IOException("Layer '%s' not found in file '%s'", options.layer_name, first_file.path);
 		}
 	} else if (options.layer_idx >= 0) {
 		layer = dataset->GetLayer(options.layer_idx);
 		if (!layer) {
-			throw IOException("Layer index %d not found in file '%s'", options.layer_idx, first_file->path);
+			throw IOException("Layer index %d not found in file '%s'", options.layer_idx, first_file.path);
 		}
 	} else {
 		// Default to first layer
 		layer = dataset->GetLayer(0);
 		if (!layer) {
-			throw IOException("No layers found in file '%s'", first_file->path);
+			throw IOException("No layers found in file '%s'", first_file.path);
 		}
 	}
 
@@ -435,9 +444,6 @@ void GDALMultiLayerInfo::BindReader(ClientContext &context, vector<LogicalType> 
 }
 
 void GDALMultiLayerInfo::FinalizeBindData(MultiFileBindData &multi_file_data) {
-	auto &gdal_bind_data = multi_file_data.bind_data->Cast<GDALBindData>();
-	auto &options = gdal_bind_data.options;
-
 	// TODO: anything more needs to be done here?
 }
 
@@ -465,22 +471,24 @@ unique_ptr<LocalTableFunctionState> GDALMultiLayerInfo::InitializeLocalState(Exe
 shared_ptr<BaseFileReader> GDALMultiLayerInfo::CreateReader(ClientContext &context, GlobalTableFunctionState &gstate,
                                                            BaseUnionData &union_data, const MultiFileBindData &bind_data_p) {
 	auto &bind_data = bind_data_p.bind_data->Cast<GDALBindData>();
-	auto &reader_data = bind_data_p.reader_bind;
-	auto &options = reader_data.options->Cast<GDALMultiLayerReaderOptions>();
 	
-	return make_shared<GDALFileReader>(context, union_data.first_file, options, 
-	                                   bind_data.all_types, bind_data.all_names);
+	GDALMultiLayerReaderOptions options;
+	options.options = bind_data.options;
+	
+	return make_shared_ptr<GDALFileReader>(context, union_data.file, options, 
+	                                      bind_data.all_types, bind_data.all_names);
 }
 
 shared_ptr<BaseFileReader> GDALMultiLayerInfo::CreateReader(ClientContext &context, GlobalTableFunctionState &gstate,
                                                            const OpenFileInfo &file, idx_t file_idx,
                                                            const MultiFileBindData &bind_data_p) {
 	auto &bind_data = bind_data_p.bind_data->Cast<GDALBindData>();
-	auto &reader_data = bind_data_p.reader_bind;
-	auto &options = reader_data.options->Cast<GDALMultiLayerReaderOptions>();
 	
-	return make_shared<GDALFileReader>(context, file, options, 
-	                                   bind_data.all_types, bind_data.all_names);
+	GDALMultiLayerReaderOptions options;
+	options.options = bind_data.options;
+	
+	return make_shared_ptr<GDALFileReader>(context, file, options, 
+	                                      bind_data.all_types, bind_data.all_names);
 }
 
 shared_ptr<BaseFileReader> GDALMultiLayerInfo::CreateReader(ClientContext &context, const OpenFileInfo &file,
@@ -489,7 +497,7 @@ shared_ptr<BaseFileReader> GDALMultiLayerInfo::CreateReader(ClientContext &conte
 	auto &gdal_options = options.Cast<GDALMultiLayerReaderOptions>();
 	vector<LogicalType> empty_types;
 	vector<string> empty_names;
-	return make_shared<GDALFileReader>(context, file, gdal_options, empty_types, empty_names);
+	return make_shared_ptr<GDALFileReader>(context, file, gdal_options, empty_types, empty_names);
 }
 
 void GDALMultiLayerInfo::FinishReading(ClientContext &context, GlobalTableFunctionState &global_state,

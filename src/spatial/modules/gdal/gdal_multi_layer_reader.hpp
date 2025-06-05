@@ -9,8 +9,6 @@
 
 namespace duckdb {
 
-// Forward declarations
-class GDALDataset;
 using GDALDatasetUniquePtr = unique_ptr<GDALDataset, void (*)(GDALDataset *)>;
 
 struct SpatialFilterBox {
@@ -24,13 +22,13 @@ struct GDALOptions {
 	// Layer selection
 	string layer_name;
 	int layer_idx;
-	
+
 	// Options
 	CPLStringList open_options;
 	CPLStringList allowed_drivers;
 	CPLStringList sibling_files;
 	bool keep_wkb;
-	
+
 	// Spatial filter
 	bool has_spatial_filter;
 	SpatialFilterBox spatial_filter_box;

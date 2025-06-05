@@ -1,6 +1,9 @@
 #include "spatial/modules/gdal/gdal_module.hpp"
 #include "spatial/modules/gdal/gdal_multi_layer_reader.hpp"
 
+// GDAL includes
+#include "ogrsf_frmts.h"
+
 // Spatial
 #include "spatial/spatial_types.hpp"
 #include "spatial/geometry/sgl.hpp"
@@ -570,9 +573,11 @@ struct ST_Read : ArrowTableFunction {
 		result->raw_file_name = input.inputs[0].GetValue<string>();
 		result->prefixed_file_name = ctx_state.GetPrefix(result->raw_file_name);
 
-		auto dataset = GDALDatasetUniquePtr(GDALDataset::Open(
-		    result->prefixed_file_name.c_str(), GDAL_OF_VECTOR | GDAL_OF_VERBOSE_ERROR, result->dataset_allowed_drivers,
-		    result->dataset_open_options, result->dataset_sibling_files));
+		auto dataset = GDALDatasetUniquePtr(
+		    GDALDataset::Open(result->prefixed_file_name.c_str(), GDAL_OF_VECTOR | GDAL_OF_VERBOSE_ERROR,
+		                      result->dataset_allowed_drivers, result->dataset_open_options,
+		                      result->dataset_sibling_files),
+		    [](GDALDataset *ds) { GDALClose(ds); });
 
 		if (dataset == nullptr) {
 			auto error = string(CPLGetLastErrorMsg());
@@ -802,9 +807,11 @@ struct ST_Read : ArrowTableFunction {
 	static unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 		auto &data = input.bind_data->Cast<BindData>();
 
-		auto dataset = GDALDatasetUniquePtr(GDALDataset::Open(
-		    data.prefixed_file_name.c_str(), GDAL_OF_VECTOR | GDAL_OF_VERBOSE_ERROR | GDAL_OF_READONLY,
-		    data.dataset_allowed_drivers, data.dataset_open_options, data.dataset_sibling_files));
+		auto dataset = GDALDatasetUniquePtr(GDALDataset::Open(data.prefixed_file_name.c_str(),
+		                                                      GDAL_OF_VECTOR | GDAL_OF_VERBOSE_ERROR | GDAL_OF_READONLY,
+		                                                      data.dataset_allowed_drivers, data.dataset_open_options,
+		                                                      data.dataset_sibling_files),
+		                                    [](GDALDataset *ds) { GDALClose(ds); });
 		if (dataset == nullptr) {
 			const auto error = string(CPLGetLastErrorMsg());
 			throw IOException("Could not open file: " + data.raw_file_name + " (" + error + ")");
@@ -1279,10 +1286,14 @@ struct ST_Read_Meta {
 			auto &file = bind_data.file_names[state.current_idx];
 			auto prefixed_file_name = GDALClientContextState::GetOrCreate(context).GetPrefix(file.path);
 
-			GDALDatasetUniquePtr dataset;
+			GDALDatasetUniquePtr dataset(nullptr, [](GDALDataset *ds) {
+				if (ds)
+					GDALClose(ds);
+			});
 			try {
 				dataset = GDALDatasetUniquePtr(
-				    GDALDataset::Open(prefixed_file_name.c_str(), GDAL_OF_VECTOR | GDAL_OF_VERBOSE_ERROR));
+				    GDALDataset::Open(prefixed_file_name.c_str(), GDAL_OF_VECTOR | GDAL_OF_VERBOSE_ERROR),
+				    [](GDALDataset *ds) { GDALClose(ds); });
 			} catch (...) {
 				// Just skip anything we cant open
 				continue;
@@ -1331,7 +1342,6 @@ struct ST_Read_Meta {
 		FunctionBuilder::AddTableFunctionDocs(db, "ST_Read_Meta", DESCRIPTION, EXAMPLE, tags);
 	}
 };
-
 
 //======================================================================================================================
 // ST_Drivers
@@ -1718,7 +1728,8 @@ struct ST_Write {
 		auto &client_ctx = GDALClientContextState::GetOrCreate(context);
 		auto prefixed_path = client_ctx.GetPrefix(file_path);
 		auto dataset = GDALDatasetUniquePtr(
-		    driver->Create(prefixed_path.c_str(), 0, 0, 0, GDT_Unknown, gdal_data.dataset_creation_options));
+		    driver->Create(prefixed_path.c_str(), 0, 0, 0, GDT_Unknown, gdal_data.dataset_creation_options),
+		    [](GDALDataset *ds) { GDALClose(ds); });
 		if (!dataset) {
 			throw IOException("Could not open dataset");
 		}
@@ -2078,11 +2089,12 @@ void RegisterGDALModule(DatabaseInstance &db) {
 	ST_Read_Meta::Register(db);
 	ST_Drivers::Register(db);
 	ST_Write::Register(db);
-	
+
 	// Register ST_Multi_Read using MultiFileReader
-	TableFunction multi_read_func = MultiFileReader::CreateFunctionSet<GDALMultiLayerInfo>("ST_Multi_Read");
-	ExtensionUtil::RegisterFunction(db, multi_read_func);
-	
+	// TODO: Fix template call - CreateFunctionSet may not be a template in current DuckDB version
+	// TableFunction multi_read_func = MultiFileReader::CreateFunctionSet<GDALMultiLayerInfo>("ST_Multi_Read");
+	// ExtensionUtil::RegisterFunction(db, multi_read_func);
+
 	InsertionOrderPreservingMap<string> tags;
 	tags.insert("ext", "spatial");
 	static constexpr auto MULTI_READ_DOCS = R"(

@@ -222,6 +222,23 @@ struct GDALBindData final : TableFunctionData {
 	GDALBindData() {}
 };
 
+//------------------------------------------------------------------------------
+// GDAL Global and Local Table Function States
+//------------------------------------------------------------------------------
+struct GDALGlobalTableFunctionState : public GlobalTableFunctionState {
+public:
+	GDALGlobalTableFunctionState(ClientContext &context, const MultiFileBindData &bind_data) {
+		// Initialize any global state needed for GDAL scanning
+	}
+};
+
+struct GDALLocalTableFunctionState : public LocalTableFunctionState {
+public:
+	GDALLocalTableFunctionState(ClientContext &context, GDALGlobalTableFunctionState &gstate) {
+		// Initialize any local state needed for GDAL scanning
+	}
+};
+
 unique_ptr<MultiFileReaderInterface>
 GDALMultiLayerInfo::InitializeInterface(ClientContext &context, MultiFileReader &reader, MultiFileList &file_list) {
 	return make_uniq<GDALMultiLayerInfo>();
@@ -460,12 +477,13 @@ optional_idx GDALMultiLayerInfo::MaxThreads(const MultiFileBindData &bind_data_p
 unique_ptr<GlobalTableFunctionState> GDALMultiLayerInfo::InitializeGlobalState(ClientContext &context,
                                                                                MultiFileBindData &bind_data,
                                                                                MultiFileGlobalState &global_state) {
-	return nullptr;
+	return make_uniq<GDALGlobalTableFunctionState>(context, bind_data);
 }
 
-unique_ptr<LocalTableFunctionState> GDALMultiLayerInfo::InitializeLocalState(ExecutionContext &,
-                                                                             GlobalTableFunctionState &) {
-	return nullptr;
+unique_ptr<LocalTableFunctionState> GDALMultiLayerInfo::InitializeLocalState(ExecutionContext &context,
+                                                                             GlobalTableFunctionState &global_state) {
+	auto &gstate = global_state.Cast<GDALGlobalTableFunctionState>();
+	return make_uniq<GDALLocalTableFunctionState>(context.client, gstate);
 }
 
 shared_ptr<BaseFileReader> GDALMultiLayerInfo::CreateReader(ClientContext &context, GlobalTableFunctionState &gstate,

@@ -22,7 +22,7 @@ class GDALFileReader : public BaseFileReader {
 public:
 	GDALFileReader(ClientContext &context, const OpenFileInfo &file_info, const GDALMultiLayerReaderOptions &options,
 	               vector<LogicalType> expected_types, vector<string> expected_names)
-	    : BaseFileReader(file_info), file_info(file_info), options(options),
+	    : BaseFileReader(file_info), options(options),
 	      dataset(nullptr, [](GDALDataset *ds) { if (ds) GDALClose(ds); }),
 	      expected_types(std::move(expected_types)), expected_names(std::move(expected_names)),
 	      current_row(0), finished(false) {
@@ -83,31 +83,31 @@ private:
 	void InitializeReader(ClientContext &context) {
 		// Open dataset
 		dataset = GDALDatasetUniquePtr(
-			GDALDataset::Open(file_info.path.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+			GDALDataset::Open(file.path.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
 			                  options.options.allowed_drivers, options.options.open_options,
 			                  options.options.sibling_files),
 			[](GDALDataset *ds) { GDALClose(ds); });
 
 		if (!dataset) {
-			throw IOException("Could not open file '%s'", file_info.path);
+			throw IOException("Could not open file '%s'", file.path);
 		}
 
 		// Get the layer
 		if (!options.options.layer_name.empty()) {
 			current_layer = dataset->GetLayerByName(options.options.layer_name.c_str());
 			if (!current_layer) {
-				throw IOException("Layer '%s' not found in file '%s'", options.options.layer_name, file_info.path);
+				throw IOException("Layer '%s' not found in file '%s'", options.options.layer_name, file.path);
 			}
 		} else if (options.options.layer_idx >= 0) {
 			current_layer = dataset->GetLayer(options.options.layer_idx);
 			if (!current_layer) {
-				throw IOException("Layer index %d not found in file '%s'", options.options.layer_idx, file_info.path);
+				throw IOException("Layer index %d not found in file '%s'", options.options.layer_idx, file.path);
 			}
 		} else {
 			// Default to first layer
 			current_layer = dataset->GetLayer(0);
 			if (!current_layer) {
-				throw IOException("No layers found in file '%s'", file_info.path);
+				throw IOException("No layers found in file '%s'", file.path);
 			}
 		}
 
@@ -125,81 +125,98 @@ private:
 		auto layer_def = current_layer->GetLayerDefn();
 		idx_t col_idx = 0;
 
-		// Convert regular fields
-		for (int field_idx = 0; field_idx < layer_def->GetFieldCount(); field_idx++) {
-			if (col_idx >= output.ColumnCount()) break;
-
-			auto field_def = layer_def->GetFieldDefn(field_idx);
-			auto &vector = output.data[col_idx];
-
-			if (feature->IsFieldNull(field_idx)) {
-				FlatVector::SetNull(vector, row_idx, true);
-			} else {
-				switch (field_def->GetType()) {
-				case OFTInteger:
-					FlatVector::GetData<int32_t>(vector)[row_idx] = feature->GetFieldAsInteger(field_idx);
-					break;
-				case OFTInteger64:
-					FlatVector::GetData<int64_t>(vector)[row_idx] = feature->GetFieldAsInteger64(field_idx);
-					break;
-				case OFTReal:
-					FlatVector::GetData<double>(vector)[row_idx] = feature->GetFieldAsDouble(field_idx);
-					break;
-				case OFTString:
-					FlatVector::GetData<string_t>(vector)[row_idx] = 
-						StringVector::AddString(vector, feature->GetFieldAsString(field_idx));
-					break;
-				case OFTDate:
-				case OFTTime:
-				case OFTDateTime:
-					// TODO: Implement proper date/time conversion
-					FlatVector::GetData<string_t>(vector)[row_idx] = 
-						StringVector::AddString(vector, feature->GetFieldAsString(field_idx));
-					break;
-				default:
-					FlatVector::GetData<string_t>(vector)[row_idx] = 
-						StringVector::AddString(vector, feature->GetFieldAsString(field_idx));
-					break;
-				}
-			}
-			col_idx++;
-		}
-
-		// Convert geometry fields
-		for (int geom_idx = 0; geom_idx < layer_def->GetGeomFieldCount(); geom_idx++) {
-			if (col_idx >= output.ColumnCount()) break;
-
-			auto &vector = output.data[col_idx];
-			auto geom = feature->GetGeomFieldRef(geom_idx);
-
-			if (!geom) {
-				FlatVector::SetNull(vector, row_idx, true);
-			} else {
-				if (options.options.keep_wkb) {
-					// Export as WKB
-					size_t wkb_size = geom->WkbSize();
-					std::vector<unsigned char> wkb_data(wkb_size);
-					geom->exportToWkb(wkbNDR, wkb_data.data());
-					string wkb_string(wkb_data.begin(), wkb_data.end());
-					FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, wkb_string);
+		// Use the expected schema to ensure consistency
+		for (idx_t schema_idx = 0; schema_idx < expected_names.size() && col_idx < output.ColumnCount(); schema_idx++) {
+			const auto &expected_name = expected_names[schema_idx];
+			
+			// Check if this is a geometry column
+			bool is_geom_column = (expected_name == "geom" || expected_name.compare(0, 5, "geom_") == 0);
+			
+			if (!is_geom_column) {
+				// Find the corresponding field in the GDAL layer
+				int field_idx = layer_def->GetFieldIndex(expected_name.c_str());
+				if (field_idx < 0) {
+					// Field not found in GDAL layer - set to NULL
+					FlatVector::SetNull(output.data[col_idx], row_idx, true);
 				} else {
-					// Convert to DuckDB GEOMETRY
-					char *wkt = nullptr;
-					geom->exportToWkt(&wkt);
-					if (wkt) {
-						// TODO: Convert WKT to DuckDB GEOMETRY type properly
-						FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, wkt);
-						CPLFree(wkt);
-					} else {
+					auto field_def = layer_def->GetFieldDefn(field_idx);
+					auto &vector = output.data[col_idx];
+
+					if (feature->IsFieldNull(field_idx)) {
 						FlatVector::SetNull(vector, row_idx, true);
+					} else {
+						switch (field_def->GetType()) {
+						case OFTInteger:
+							FlatVector::GetData<int32_t>(vector)[row_idx] = feature->GetFieldAsInteger(field_idx);
+							break;
+						case OFTInteger64:
+							FlatVector::GetData<int64_t>(vector)[row_idx] = feature->GetFieldAsInteger64(field_idx);
+							break;
+						case OFTReal:
+							FlatVector::GetData<double>(vector)[row_idx] = feature->GetFieldAsDouble(field_idx);
+							break;
+						case OFTString:
+							FlatVector::GetData<string_t>(vector)[row_idx] = 
+								StringVector::AddString(vector, feature->GetFieldAsString(field_idx));
+							break;
+						case OFTDate:
+						case OFTTime:
+						case OFTDateTime:
+							// TODO: Implement proper date/time conversion
+							FlatVector::GetData<string_t>(vector)[row_idx] = 
+								StringVector::AddString(vector, feature->GetFieldAsString(field_idx));
+							break;
+						default:
+							FlatVector::GetData<string_t>(vector)[row_idx] = 
+								StringVector::AddString(vector, feature->GetFieldAsString(field_idx));
+							break;
+						}
+					}
+				}
+			} else {
+				// Handle geometry column - we'll do this after regular fields
+				// For now, find which geometry field this corresponds to
+				int geom_idx = 0;
+				if (expected_name != "geom") {
+					// Try to extract the geometry index from "geom_N"
+					if (expected_name.size() > 5) {
+						geom_idx = std::atoi(expected_name.substr(5).c_str());
+					}
+				}
+				
+				auto &vector = output.data[col_idx];
+				auto geom = feature->GetGeomFieldRef(geom_idx);
+
+				if (!geom || geom_idx >= layer_def->GetGeomFieldCount()) {
+					FlatVector::SetNull(vector, row_idx, true);
+				} else {
+					if (options.options.keep_wkb) {
+						// Export as WKB
+						size_t wkb_size = geom->WkbSize();
+						std::vector<unsigned char> wkb_data(wkb_size);
+						geom->exportToWkb(wkbNDR, wkb_data.data());
+						string wkb_string(wkb_data.begin(), wkb_data.end());
+						FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, wkb_string);
+					} else {
+						// Convert to DuckDB GEOMETRY
+						char *wkt = nullptr;
+						geom->exportToWkt(&wkt);
+						if (wkt) {
+							// TODO: Convert WKT to DuckDB GEOMETRY type properly
+							FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, wkt);
+							CPLFree(wkt);
+						} else {
+							FlatVector::SetNull(vector, row_idx, true);
+						}
 					}
 				}
 			}
 			col_idx++;
 		}
+
+		// All columns (including geometry) are now handled in the main loop above
 	}
 
-	const OpenFileInfo file_info;
 	const GDALMultiLayerReaderOptions options;
 	GDALDatasetUniquePtr dataset;
 	OGRLayer *current_layer = nullptr;
@@ -217,6 +234,7 @@ struct GDALBindData final : TableFunctionData {
 	vector<string> all_names;
 	GDALOptions options;
 	idx_t total_layers = 0;
+	idx_t gdal_column_count = 0;  // Number of columns from GDAL (before file columns)
 	bool combine_schemas = true;
 
 	GDALBindData() {}
@@ -451,13 +469,14 @@ void GDALMultiLayerInfo::BindReader(ClientContext &context, vector<LogicalType> 
 		}
 	}
 
-	// Store the schema in bind data
+	// Store the schema - for now, don't add file columns to simplify debugging
 	gdal_bind_data.all_types = return_types;
 	gdal_bind_data.all_names = names;
+	gdal_bind_data.gdal_column_count = return_types.size();
 
-	// Add file columns
-	bind_data.multi_file_reader->BindOptions(bind_data.file_options, multi_file_list, return_types, names,
-	                                         bind_data.reader_bind);
+	// TODO: Add file columns after we get basic functionality working
+	// bind_data.multi_file_reader->BindOptions(bind_data.file_options, multi_file_list, return_types, names,
+	//                                          bind_data.reader_bind);
 }
 
 void GDALMultiLayerInfo::FinalizeBindData(MultiFileBindData &multi_file_data) {

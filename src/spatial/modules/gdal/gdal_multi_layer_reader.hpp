@@ -5,17 +5,35 @@
 // GDAL
 #include "cpl_string.h"
 #include "ogr_core.h"
+#include "ogrsf_frmts.h"
 
 namespace duckdb {
 
+// Forward declarations
+class GDALDataset;
+using GDALDatasetUniquePtr = unique_ptr<GDALDataset, void (*)(GDALDataset *)>;
+
+struct SpatialFilterBox {
+	double min_x, min_y, max_x, max_y;
+};
+
 struct GDALOptions {
-	explicit GDALOptions() {
+	explicit GDALOptions() : layer_idx(-1), keep_wkb(false), has_spatial_filter(false) {
 	}
 
-	string target_srs;
-	string driver_name;
-	CPLStringList dataset_creation_options;
-	CPLStringList layer_creation_options;
+	// Layer selection
+	string layer_name;
+	int layer_idx;
+	
+	// Options
+	CPLStringList open_options;
+	CPLStringList allowed_drivers;
+	CPLStringList sibling_files;
+	bool keep_wkb;
+	
+	// Spatial filter
+	bool has_spatial_filter;
+	SpatialFilterBox spatial_filter_box;
 };
 
 class GDALMultiLayerReaderOptions : public BaseFileReaderOptions {

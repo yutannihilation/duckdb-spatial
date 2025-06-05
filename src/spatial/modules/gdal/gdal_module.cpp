@@ -1,4 +1,5 @@
 #include "spatial/modules/gdal/gdal_module.hpp"
+#include "spatial/modules/gdal/gdal_multi_layer_reader.hpp"
 
 // Spatial
 #include "spatial/spatial_types.hpp"
@@ -1331,6 +1332,7 @@ struct ST_Read_Meta {
 	}
 };
 
+
 //======================================================================================================================
 // ST_Drivers
 //======================================================================================================================
@@ -2076,6 +2078,33 @@ void RegisterGDALModule(DatabaseInstance &db) {
 	ST_Read_Meta::Register(db);
 	ST_Drivers::Register(db);
 	ST_Write::Register(db);
+	
+	// Register ST_Multi_Read using MultiFileReader
+	TableFunction multi_read_func = MultiFileReader::CreateFunctionSet<GDALMultiLayerInfo>("ST_Multi_Read");
+	ExtensionUtil::RegisterFunction(db, multi_read_func);
+	
+	InsertionOrderPreservingMap<string> tags;
+	tags.insert("ext", "spatial");
+	static constexpr auto MULTI_READ_DOCS = R"(
+		Read multiple GDAL files and union them into a single result set.
+		
+		This function uses the MultiFileReader framework to read multiple geospatial files
+		and combine them. Useful for reading many shapefiles or other formats at once.
+		
+		| Parameter | Type | Description |
+		| --------- | ---- | ----------- |
+		| path | VARCHAR | File glob pattern for files to read |
+		| layer | VARCHAR/INTEGER | Layer name or index to read from each file |
+		| keep_wkb | BOOLEAN | Return geometries as WKB_BLOB instead of GEOMETRY |
+	)";
+	static constexpr auto MULTI_READ_EXAMPLE = R"(
+		-- Read all shapefiles in a directory
+		SELECT * FROM ST_Multi_Read('data/*.shp');
+		
+		-- Read specific layer from multiple GeoPackage files
+		SELECT * FROM ST_Multi_Read('data/*.gpkg', layer = 'boundaries');
+	)";
+	FunctionBuilder::AddTableFunctionDocs(db, "ST_Multi_Read", MULTI_READ_DOCS, MULTI_READ_EXAMPLE, tags);
 }
 
 } // namespace duckdb

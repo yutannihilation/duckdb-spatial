@@ -1,4 +1,5 @@
 #include "gdal_multi_layer_reader.hpp"
+#include "gdal_utils.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -81,43 +82,20 @@ public:
 
 private:
 	void InitializeReader(ClientContext &context) {
-		// Open dataset
-		dataset = GDALDatasetUniquePtr(
-			GDALDataset::Open(file.path.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
-			                  options.options.allowed_drivers, options.options.open_options,
-			                  options.options.sibling_files),
-			[](GDALDataset *ds) { GDALClose(ds); });
+		// Open dataset using utility function
+		GDALUtils::OpenOptions open_opts;
+		open_opts.allowed_drivers = options.options.allowed_drivers;
+		open_opts.open_options = options.options.open_options;
+		open_opts.sibling_files = options.options.sibling_files;
+		
+		dataset = GDALUtils::OpenDataset(file.path, open_opts);
 
-		if (!dataset) {
-			throw IOException("Could not open file '%s'", file.path);
-		}
-
-		// Get the layer
-		if (!options.options.layer_name.empty()) {
-			current_layer = dataset->GetLayerByName(options.options.layer_name.c_str());
-			if (!current_layer) {
-				throw IOException("Layer '%s' not found in file '%s'", options.options.layer_name, file.path);
-			}
-		} else if (options.options.layer_idx >= 0) {
-			current_layer = dataset->GetLayer(options.options.layer_idx);
-			if (!current_layer) {
-				throw IOException("Layer index %d not found in file '%s'", options.options.layer_idx, file.path);
-			}
-		} else {
-			// Default to first layer
-			current_layer = dataset->GetLayer(0);
-			if (!current_layer) {
-				throw IOException("No layers found in file '%s'", file.path);
-			}
-		}
+		// Get the layer using utility function
+		current_layer = GDALUtils::GetLayer(dataset.get(), options.options.layer_name, options.options.layer_idx);
 
 		// Apply spatial filter if specified
 		if (options.options.has_spatial_filter) {
-			current_layer->SetSpatialFilterRect(
-				options.options.spatial_filter_box.min_x,
-				options.options.spatial_filter_box.min_y,
-				options.options.spatial_filter_box.max_x,
-				options.options.spatial_filter_box.max_y);
+			SpatialFilterHelper::ApplyBoxFilter(current_layer, options.options.spatial_filter_box);
 		}
 	}
 
@@ -141,41 +119,11 @@ private:
 				} else {
 					auto field_def = layer_def->GetFieldDefn(field_idx);
 					auto &vector = output.data[col_idx];
-
-					if (feature->IsFieldNull(field_idx)) {
-						FlatVector::SetNull(vector, row_idx, true);
-					} else {
-						switch (field_def->GetType()) {
-						case OFTInteger:
-							FlatVector::GetData<int32_t>(vector)[row_idx] = feature->GetFieldAsInteger(field_idx);
-							break;
-						case OFTInteger64:
-							FlatVector::GetData<int64_t>(vector)[row_idx] = feature->GetFieldAsInteger64(field_idx);
-							break;
-						case OFTReal:
-							FlatVector::GetData<double>(vector)[row_idx] = feature->GetFieldAsDouble(field_idx);
-							break;
-						case OFTString:
-							FlatVector::GetData<string_t>(vector)[row_idx] = 
-								StringVector::AddString(vector, feature->GetFieldAsString(field_idx));
-							break;
-						case OFTDate:
-						case OFTTime:
-						case OFTDateTime:
-							// TODO: Implement proper date/time conversion
-							FlatVector::GetData<string_t>(vector)[row_idx] = 
-								StringVector::AddString(vector, feature->GetFieldAsString(field_idx));
-							break;
-						default:
-							FlatVector::GetData<string_t>(vector)[row_idx] = 
-								StringVector::AddString(vector, feature->GetFieldAsString(field_idx));
-							break;
-						}
-					}
+					// Use utility function for field conversion
+					GDALUtils::ConvertOGRFieldToVector(feature, field_idx, field_def, vector, row_idx);
 				}
 			} else {
-				// Handle geometry column - we'll do this after regular fields
-				// For now, find which geometry field this corresponds to
+				// Handle geometry column
 				int geom_idx = 0;
 				if (expected_name != "geom") {
 					// Try to extract the geometry index from "geom_N"
@@ -191,30 +139,16 @@ private:
 					FlatVector::SetNull(vector, row_idx, true);
 				} else {
 					if (options.options.keep_wkb) {
-						// Export as WKB
-						size_t wkb_size = geom->WkbSize();
-						std::vector<unsigned char> wkb_data(wkb_size);
-						geom->exportToWkb(wkbNDR, wkb_data.data());
-						string wkb_string(wkb_data.begin(), wkb_data.end());
-						FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, wkb_string);
+						// Use utility function for WKB conversion
+						GDALUtils::ConvertGeometryToWKB(geom, vector, row_idx);
 					} else {
-						// Convert to DuckDB GEOMETRY
-						char *wkt = nullptr;
-						geom->exportToWkt(&wkt);
-						if (wkt) {
-							// TODO: Convert WKT to DuckDB GEOMETRY type properly
-							FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, wkt);
-							CPLFree(wkt);
-						} else {
-							FlatVector::SetNull(vector, row_idx, true);
-						}
+						// Use utility function for DuckDB GEOMETRY conversion
+						GDALUtils::ConvertGeometryToDuckDB(geom, vector, row_idx);
 					}
 				}
 			}
 			col_idx++;
 		}
-
-		// All columns (including geometry) are now handled in the main loop above
 	}
 
 	const GDALMultiLayerReaderOptions options;
@@ -380,34 +314,15 @@ void GDALMultiLayerInfo::BindReader(ClientContext &context, vector<LogicalType> 
 	auto first_file = multi_file_list.GetFirstFile();
 
 	// Open the first dataset to get schema information
-	auto dataset = GDALDatasetUniquePtr(
-		GDALDataset::Open(first_file.path.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
-		                  options.allowed_drivers, options.open_options, options.sibling_files),
-		[](GDALDataset *ds) { GDALClose(ds); });
-
-	if (!dataset) {
-		throw IOException("Could not open file '%s'", first_file.path);
-	}
+	GDALUtils::OpenOptions open_opts;
+	open_opts.allowed_drivers = options.allowed_drivers;
+	open_opts.open_options = options.open_options;
+	open_opts.sibling_files = options.sibling_files;
+	
+	auto dataset = GDALUtils::OpenDataset(first_file.path, open_opts);
 
 	// Get the layer
-	OGRLayer *layer = nullptr;
-	if (!options.layer_name.empty()) {
-		layer = dataset->GetLayerByName(options.layer_name.c_str());
-		if (!layer) {
-			throw IOException("Layer '%s' not found in file '%s'", options.layer_name, first_file.path);
-		}
-	} else if (options.layer_idx >= 0) {
-		layer = dataset->GetLayer(options.layer_idx);
-		if (!layer) {
-			throw IOException("Layer index %d not found in file '%s'", options.layer_idx, first_file.path);
-		}
-	} else {
-		// Default to first layer
-		layer = dataset->GetLayer(0);
-		if (!layer) {
-			throw IOException("No layers found in file '%s'", first_file.path);
-		}
-	}
+	OGRLayer *layer = GDALUtils::GetLayer(dataset.get(), options.layer_name, options.layer_idx);
 
 	// Get the layer definition
 	auto layer_def = layer->GetLayerDefn();
@@ -419,37 +334,9 @@ void GDALMultiLayerInfo::BindReader(ClientContext &context, vector<LogicalType> 
 		auto field_name = string(field_def->GetNameRef());
 		names.push_back(field_name);
 
-		// Map OGR field type to DuckDB type
+		// Map OGR field type to DuckDB type using utility function
 		auto field_type = field_def->GetType();
-		switch (field_type) {
-		case OFTInteger:
-			return_types.push_back(LogicalType::INTEGER);
-			break;
-		case OFTInteger64:
-			return_types.push_back(LogicalType::BIGINT);
-			break;
-		case OFTReal:
-			return_types.push_back(LogicalType::DOUBLE);
-			break;
-		case OFTString:
-			return_types.push_back(LogicalType::VARCHAR);
-			break;
-		case OFTBinary:
-			return_types.push_back(LogicalType::BLOB);
-			break;
-		case OFTDate:
-			return_types.push_back(LogicalType::DATE);
-			break;
-		case OFTTime:
-			return_types.push_back(LogicalType::TIME);
-			break;
-		case OFTDateTime:
-			return_types.push_back(LogicalType::TIMESTAMP);
-			break;
-		default:
-			return_types.push_back(LogicalType::VARCHAR);
-			break;
-		}
+		return_types.push_back(GDALUtils::OGRFieldTypeToDuckDB(field_type));
 	}
 
 	// Add geometry column(s)

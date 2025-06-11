@@ -2287,14 +2287,16 @@ struct ST_Azimuth {
 		using POINT_TYPE = StructTypeBinary<double, double>;
 		using RESULT_TYPE = PrimitiveType<double>;
 
-		GenericExecutor::ExecuteBinaryWithNulls<POINT_TYPE, POINT_TYPE, RESULT_TYPE>(
-		    left, right, result, count, [&](POINT_TYPE left_point, POINT_TYPE right_point, ValidityMask &mask, idx_t idx) {
+		GenericExecutor::ExecuteBinary<POINT_TYPE, POINT_TYPE, RESULT_TYPE>(
+		    left, right, result, count, [&](POINT_TYPE left_point, POINT_TYPE right_point) {
 			    // If the points are the same, return NULL
 			    if (left_point.a_val == right_point.a_val && left_point.b_val == right_point.b_val) {
-				    mask.SetInvalid(idx);
-				    return RESULT_TYPE{0.0};
+				    auto result = RESULT_TYPE {0.0};
+				    result.is_null = true;
+				    return result;
 			    }
-			    return RESULT_TYPE{CalcAngle(left_point.a_val, left_point.b_val, right_point.a_val, right_point.b_val)};
+			    return RESULT_TYPE {
+			        CalcAngle(left_point.a_val, left_point.b_val, right_point.a_val, right_point.b_val)};
 		    });
 	}
 
